@@ -13,20 +13,18 @@
 #include "Config.h"
 
 //////// Need to undefine Preprocessor definition for NONAMELESSUNION on this .cpp file only for this to work
-#include <TraceLoggingProvider.h>
-#include "Telemetry.h"
+#include "psf_tracelogging.h"
 
 #include "Logging.h"
+#include "Psapi.h"
 
 // This handles event logging via ETW
 // NOTE: The provider name and GUID must be kept in sync with PsfShimMonitor/MainWindow.xaml.cs
 //       The format of the provider name uses dots here and dashes in C#.
-TRACELOGGING_DECLARE_PROVIDER(g_Log_ETW_ComponentProvider);
 TRACELOGGING_DEFINE_PROVIDER(
     g_Log_ETW_ComponentProvider,
-    "Microsoft.Windows.PSFRuntime",
-    (0xf7f4e8c4, 0x9981, 0x5221, 0xe6, 0xfb, 0xff, 0x9d, 0xd1, 0xcd, 0xa4, 0xe1),
-    TraceLoggingOptionMicrosoftTelemetry());
+    "Microsoft.Windows.PSFTraceFixup",
+    (0x7c1d7c1c, 0x544b, 0x5179, 0x28, 0x01, 0x39, 0x29, 0xf0, 0x01, 0x78, 0x02));
 
 using namespace std::literals;
 
@@ -42,7 +40,7 @@ static trace_level g_defaultTraceLevel = trace_level::unexpected_failures;
 static const psf::json_object* g_breakLevels = nullptr;
 static trace_level g_defaultBreakLevel = trace_level::ignore;
 
-
+char exe_path[2048] = {};
 
 
 
@@ -192,17 +190,57 @@ void Log_ETW_PostMsgOperationA(const char* operation, const char* inputs, const 
             TraceLoggingValue(inputs, "Inputs"),
             TraceLoggingValue(result, "Result"),
             TraceLoggingValue(outputs, "Outputs"),
-            TraceLoggingValue(callingmodule, "Caller"),
+            TraceLoggingValue(callingmodule, "CallerModule"),
+            TraceLoggingValue(exe_path, "CallerProcess"),
             TraceLoggingInt64(TickStart.QuadPart, "Start"),
-            TraceLoggingInt64(TickEnd.QuadPart, "End")
+            TraceLoggingInt64(TickEnd.QuadPart, "End"),
+            TraceLoggingBoolean(TRUE, "UTCReplace_AppSessionGuid"),
+            TelemetryPrivacyDataTag(PDT_ProductAndServiceUsage),
+            TraceLoggingKeyword(MICROSOFT_KEYWORD_MEASURES)
         ); // Field for your event in the form of (value, field name).
+
+#if _DEBUG
+        std::string combined = "operation:\n" + std::string(operation) + "\n" + "inputs:\n" + std::string(inputs) + "\n" +
+            "result:\n" + std::string(result) + "\n" + "outputs:\n" + std::string(outputs) + "\n" +
+            "callingmodule:\n" + std::string(callingmodule) + "\n" +
+            "callingProcess:\n" + std::string(exe_path) + "\n" +
+            "\n-----------------------------------\n";
+
+        wchar_t tempPath[MAX_PATH];
+        (DWORD)GetTempPathW(MAX_PATH, tempPath);
+
+        wchar_t filePath[MAX_PATH];
+        wcscpy_s(filePath, tempPath);
+        wcscat_s(filePath, L"PSF_EventLogs.txt");
+
+        HANDLE hFile = CreateFileW(
+            filePath,                  // File path and name
+            FILE_APPEND_DATA,             // Desired access (write)
+            0,                         // Share mode (none)
+            NULL,                      // Security attributes (default)
+            OPEN_EXISTING,             // Open existing file
+            FILE_ATTRIBUTE_NORMAL,     // File attributes (normal)
+            NULL                       // Template file (none)
+        );
+
+        DWORD bytesWritten;
+        (BOOL)WriteFile(
+            hFile,                      // File handle
+            combined.c_str(),               // Data buffer
+            static_cast<DWORD>(combined.length() * sizeof(char)),  // Number of bytes to write
+            &bytesWritten,              // Number of bytes written
+            NULL                        // Overlapped structure (not used)
+        );
+
+        CloseHandle(hFile);
+#endif
     }
     catch (...)
     {
         // Unable to log should not crash an app. 
         ::OutputDebugStringA("Unable to write to trace.");
     }
-}
+} 
 
 void Log_ETW_PostMsgW(const wchar_t* s)
 {
@@ -239,6 +277,29 @@ BOOL __stdcall DllMain(HINSTANCE, DWORD reason, LPVOID) noexcept try
     if (reason == DLL_PROCESS_ATTACH)
     {
         Log_ETW_Register();
+
+        HANDLE h = GetCurrentProcess();
+        GetModuleFileNameExA(h, 0, exe_path, sizeof(exe_path) - 1);
+
+#if _DEBUG
+        wchar_t tempPath[MAX_PATH];
+        (DWORD)GetTempPathW(MAX_PATH, tempPath);
+
+        wchar_t filePath[MAX_PATH];
+        wcscpy_s(filePath, tempPath);
+        wcscat_s(filePath, L"PSF_EventLogs.txt");
+
+        HANDLE hFile = CreateFile(
+            filePath,                   // File path and name
+            GENERIC_WRITE,             // Desired access (write)
+            0,                         // Share mode (none)
+            NULL,                      // Security attributes (default)
+            CREATE_ALWAYS,             // Creation disposition (create new file)
+            FILE_ATTRIBUTE_NORMAL,     // File attributes (normal)
+            NULL                       // Template file (none)
+        );
+        CloseHandle(hFile);
+#endif
 
         std::wstringstream traceDataStream;
 
@@ -319,13 +380,7 @@ BOOL __stdcall DllMain(HINSTANCE, DWORD reason, LPVOID) noexcept try
             }
             try
             {
-                TraceLoggingWrite(
-                    g_Log_ETW_ComponentProvider,
-                    "TraceFixupConfigdata",
-                    TraceLoggingWideString(traceDataStream.str().c_str(), "TraceFixupConfig"),
-                    TraceLoggingBoolean(TRUE, "UTCReplace_AppSessionGuid"),
-                    TelemetryPrivacyDataTag(PDT_ProductAndServiceUsage),
-                    TraceLoggingKeyword(MICROSOFT_KEYWORD_CRITICAL_DATA));
+                psf::TraceLogFixupConfig("TraceFixup", traceDataStream.str().c_str());
             }
             catch (...)
             {
@@ -348,6 +403,7 @@ BOOL __stdcall DllMain(HINSTANCE, DWORD reason, LPVOID) noexcept try
 }
 catch (...)
 {
+    psf::TraceLogExceptions("TraceFixupException", "TraceFixup attach ERROR");
     ::SetLastError(win32_from_caught_exception());
     return FALSE;
 }
